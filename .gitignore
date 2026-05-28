@@ -1,18 +1,25 @@
-# Rust — compilados (muy pesados, se regeneran con cargo build)
-target/
-Cargo.lock
+# Dependencias
+node_modules/
 
-# Variables de entorno — contienen secretos, NUNCA al repo
+# Next.js build
+.next/
+out/
+
+# Variables de entorno — contienen secretos
 .env
-
-# Base de datos
-pgdata/
-*.sql.bak
+.env.local
+.env.production
+.env.development.local
 
 # Logs
 *.log
+npm-debug.log*
 
 # IDE
 .vscode/
 .idea/
 *.swp
+
+# OS
+.DS_Store
+Thumbs.db
