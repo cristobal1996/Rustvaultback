@@ -1,0 +1,18 @@
+# Rust — compilados (muy pesados, se regeneran con cargo build)
+target/
+Cargo.lock
+
+# Variables de entorno — contienen secretos, NUNCA al repo
+.env
+
+# Base de datos
+pgdata/
+*.sql.bak
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
