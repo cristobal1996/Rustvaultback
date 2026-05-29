@@ -1,26 +1,18 @@
-# Dependencias
-node_modules/
+# Rust — compilados
+target/
+Cargo.lock
 
-# Next.js build
-.next/
-out/
-
-# Variables de entorno — contienen secretos
+# Variables de entorno
 .env
-.env.local
-.env.production
-.env.development.local
+
+# Base de datos
+pgdata/
+*.sql.bak
 
 # Logs
 *.log
-npm-debug.log*
 
 # IDE
 .vscode/
 .idea/
 *.swp
-
-# OS
-.DS_Store
-Thumbs.db
-target/
