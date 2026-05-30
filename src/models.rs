@@ -26,6 +26,7 @@ pub struct User {
     pub created_at:                DateTime<Utc>,
     pub last_login_at:             Option<DateTime<Utc>>,
     pub deleted_at:                Option<DateTime<Utc>>,
+    pub recovery_blob:             Option<JsonValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +38,7 @@ pub struct UserPublic {
     pub invite_code:         Option<String>,
     pub pub_key:             Option<String>,
     pub encrypted_priv_key:  Option<JsonValue>,
+    pub recovery_blob:       Option<JsonValue>,
     pub created_at:          DateTime<Utc>,
 }
 
@@ -50,6 +52,7 @@ impl From<User> for UserPublic {
             invite_code:         u.invite_code,
             pub_key:             u.pub_key,
             encrypted_priv_key:  u.encrypted_priv_key,
+            recovery_blob:       u.recovery_blob.clone().map(|_| serde_json::json!(true)), // solo indicar si existe
             created_at:          u.created_at,
         }
     }

@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/:id",            get(get_password).put(update_password).delete(delete_password))
         .route("/:id/versions",   get(get_versions))
         .route("/:id/restore/:v", post(restore_version))
+        .route("/passwords/bulk-update", post(bulk_update))
 }
 
 #[derive(Deserialize)]
@@ -264,4 +265,42 @@ async fn restore_version(
 async fn audit(db: &sqlx::PgPool, user_id: Uuid, action: &str) {
     let _ = sqlx::query("INSERT INTO audit_log (user_id,action) VALUES ($1,$2)")
         .bind(user_id).bind(action).execute(db).await;
+}
+
+// 2. Añadir el handler al final del fichero:
+
+#[derive(serde::Deserialize)]
+pub struct BulkUpdateRequest {
+    pub re_encrypted_passwords: Vec<ReEncryptedPassword>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReEncryptedPassword {
+    pub id:        uuid::Uuid,
+    pub encrypted: serde_json::Value,
+}
+
+async fn bulk_update(
+    State(state): State<AppState>,
+    auth: crate::middleware::AuthUser,
+    Json(req): Json<BulkUpdateRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let mut tx = state.db.begin().await?;
+    let mut updated = 0;
+    for pw in &req.re_encrypted_passwords {
+        let result = sqlx::query(
+            "UPDATE passwords SET encrypted=$1, updated_at=NOW()
+             WHERE id=$2 AND user_id=$3 AND NOT is_deleted"
+        )
+        .bind(&pw.encrypted)
+        .bind(pw.id)
+        .bind(auth.user_id)
+        .execute(&mut *tx).await?;
+        updated += result.rows_affected();
+    }
+    sqlx::query("INSERT INTO audit_log (user_id,action) VALUES ($1,$2)")
+        .bind(auth.user_id).bind("passwords.bulk_reencrypted")
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "updated": updated })))
 }

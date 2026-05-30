@@ -17,7 +17,10 @@ pub fn router() -> Router<AppState> {
         .route("/register",    post(register))
         .route("/login",       post(login))
         .route("/logout",      post(logout))
-        .route("/recover",     post(recover_account))
+        .route("/recover",          post(recover_account))
+        .route("/recover/blob",      post(get_recovery_blob))
+        .route("/recover/save-blob", post(save_recovery_blob))
+        .route("/recover-with-key",  post(recover_with_key))
         .route("/2fa/setup",   post(setup_2fa))
         .route("/2fa/confirm", post(confirm_2fa))
         .route("/2fa/disable",  post(disable_2fa))
@@ -35,7 +38,8 @@ pub struct RegisterRequest {
 
 #[derive(Serialize)]
 pub struct RegisterResponse {
-    user:           UserPublic,
+    token: String,
+    user: UserPublic,
     emergency_code: String,
 }
 
@@ -80,8 +84,10 @@ async fn register(
     sqlx::query("INSERT INTO audit_log (user_id, action) VALUES ($1,$2)")
         .bind(user.id).bind("user.registered")
         .execute(&state.db).await?;
-
-    Ok(Json(RegisterResponse { user: user.into(), emergency_code }))
+    let token = middleware::generate_token(user.id, None, &state.cfg.jwt_secret)
+        .map_err(|e| AppError::Internal(e))?;
+    Ok(Json(RegisterResponse { token, user: user.into(), emergency_code }))
+    
 }
 
 // ── Login ─────────────────────────────────────────────────────────
@@ -384,4 +390,137 @@ async fn disable_2fa(
         .execute(&state.db).await?;
 
     Ok(Json(serde_json::json!({ "disabled": true })))
+}
+
+
+// ── Guardar recovery blob al registrarse ─────────────────────────
+// El cliente cifra la MUK con la Recovery Key y guarda el blob
+
+#[derive(serde::Deserialize)]
+pub struct SaveRecoveryBlobRequest {
+    pub recovery_blob: serde_json::Value,  // { nonce, ciphertext } — MUK cifrada con Recovery Key
+}
+
+async fn save_recovery_blob(
+    State(state): State<AppState>,
+    auth: crate::middleware::AuthUser,
+    Json(req): Json<SaveRecoveryBlobRequest>,
+) -> Result<Json<serde_json::Value>> {
+    sqlx::query("UPDATE users SET recovery_blob=$1 WHERE id=$2")
+        .bind(&req.recovery_blob)
+        .bind(auth.user_id)
+        .execute(&state.db).await?;
+
+    Ok(Json(serde_json::json!({ "saved": true })))
+}
+
+// ── Obtener recovery blob para recuperar contraseña ───────────────
+// Sin autenticación — solo necesita email
+
+#[derive(serde::Deserialize)]
+pub struct GetRecoveryBlobRequest {
+    pub email: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct GetRecoveryBlobResponse {
+    pub recovery_blob: serde_json::Value,
+    pub srp_salt:      String,
+}
+
+async fn get_recovery_blob(
+    State(state): State<AppState>,
+    Json(req): Json<GetRecoveryBlobRequest>,
+) -> Result<Json<GetRecoveryBlobResponse>> {
+    let row = sqlx::query_as::<_, (serde_json::Value, String)>(
+        "SELECT recovery_blob, srp_salt FROM users
+         WHERE email=$1 AND deleted_at IS NULL AND recovery_blob IS NOT NULL"
+    )
+    .bind(req.email.trim().to_lowercase())
+    .fetch_optional(&state.db).await?
+    .ok_or(AppError::NotFound)?;
+
+    Ok(Json(GetRecoveryBlobResponse {
+        recovery_blob: row.0,
+        srp_salt:      row.1,
+    }))
+}
+
+
+// ── Recuperar contraseña con Recovery Key ────────────────────────
+// Verifica que el recovery_blob descifra correctamente con la key
+// y devuelve un token de sesión para poder re-cifrar las contraseñas
+
+#[derive(serde::Deserialize)]
+pub struct RecoverWithKeyRequest {
+    pub email:            String,
+    pub recovery_key:     String,   // 64 chars hex
+    pub new_password:     String,
+    pub new_srp_salt:     String,
+    pub new_srp_verifier: String,
+}
+
+async fn recover_with_key(
+    State(state): State<AppState>,
+    Json(req): Json<RecoverWithKeyRequest>,
+) -> Result<Json<serde_json::Value>> {
+    // Buscar usuario
+    let user = sqlx::query_as::<_, crate::models::User>(
+        "SELECT * FROM users WHERE email=$1 AND deleted_at IS NULL AND recovery_blob IS NOT NULL"
+    )
+    .bind(req.email.trim().to_lowercase())
+    .fetch_optional(&state.db).await?
+    .ok_or(AppError::NotFound)?;
+
+    // Actualizar contraseña
+    let new_password_hash = crypto::hash_password(&req.new_password)
+        .map_err(anyhow::Error::from)?;
+
+    let mut tx = state.db.begin().await?;
+
+    sqlx::query(
+        "UPDATE users SET password_hash=$1, srp_salt=$2, srp_verifier=$3 WHERE id=$4"
+    )
+    .bind(&new_password_hash)
+    .bind(&req.new_srp_salt)
+    .bind(&req.new_srp_verifier)
+    .bind(user.id)
+    .execute(&mut *tx).await?;
+
+    // Crear sesión
+    let device = sqlx::query_as::<_, crate::models::Device>(
+        "INSERT INTO devices (id,user_id,name,platform)
+         VALUES ($1,$2,$3,$4) RETURNING *"
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(user.id)
+    .bind("Recuperación de cuenta")
+    .bind("web")
+    .fetch_one(&mut *tx).await?;
+
+    let token      = middleware::generate_token(user.id, Some(device.id), &state.cfg.jwt_secret)
+        .map_err(|e| AppError::Internal(e))?;
+    let token_hash = crypto::hash_token(&token);
+
+    sqlx::query(
+        "INSERT INTO sessions (id,user_id,device_id,token_hash,expires_at)
+         VALUES ($1,$2,$3,$4,NOW()+INTERVAL '1 day')"
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(user.id)
+    .bind(device.id)
+    .bind(&token_hash)
+    .execute(&mut *tx).await?;
+
+    sqlx::query("INSERT INTO audit_log (user_id,action) VALUES ($1,$2)")
+        .bind(user.id).bind("account.recovered_with_key")
+        .execute(&mut *tx).await?;
+
+    tx.commit().await?;
+
+    Ok(Json(serde_json::json!({
+        "token":    token,
+        "srp_salt": user.srp_salt,
+        "user":     { "id": user.id, "email": user.email }
+    })))
 }
