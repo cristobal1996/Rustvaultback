@@ -13,7 +13,8 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vaultuser -d rustvaultdb"]
+      # FIX: era "vaultuser" (no existe) → "rustvaultuser"
+      test: ["CMD-SHELL", "pg_isready -U rustvaultuser -d rustvaultdb"]
       interval: 5s
       timeout:  5s
       retries:  5

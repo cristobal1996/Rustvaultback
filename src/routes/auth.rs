@@ -254,17 +254,43 @@ async fn recover_account(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::Unauthorized)?;
 
+    // Todo en una transacción: si algo falla, se revierte
+    let mut tx = state.db.begin().await?;
+
+    // 1. Revocar sesiones activas (por seguridad, aunque luego se borren con CASCADE)
     sqlx::query(
         "UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL"
-    ).bind(user.id).execute(&state.db).await?;
+    )
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
 
+    // 2. Borrar entradas del audit_log de este usuario
+    //    (audit_log.user_id no tiene ON DELETE CASCADE)
+    sqlx::query("DELETE FROM audit_log WHERE user_id=$1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    // 3. DELETE físico del usuario.
+    //    CASCADE borra automáticamente: devices, sessions, passwords,
+    //    password_versions, totp_credentials, generator_profiles,
+    //    shared_passwords (como sender y como recipient).
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    // 4. Registrar en audit_log SIN user_id (el usuario ya no existe)
     sqlx::query(
-        "UPDATE users SET deleted_at=NOW(), emergency_code_hash=NULL WHERE id=$1"
-    ).bind(user.id).execute(&state.db).await?;
+        "INSERT INTO audit_log (user_id, action, metadata)
+         VALUES (NULL, 'account.emergency_deleted', $1)"
+    )
+    .bind(serde_json::json!({ "email_hash": crypto::hash_token(&user.email) }))
+    .execute(&mut *tx)
+    .await?;
 
-    sqlx::query("INSERT INTO audit_log (user_id,action) VALUES ($1,$2)")
-        .bind(user.id).bind("account.recovered")
-        .execute(&state.db).await?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({
         "deleted": true,
