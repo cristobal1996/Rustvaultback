@@ -49,6 +49,7 @@ pub struct SendShareRequest {
     pub recipient_invite_code:   String,
     pub encrypted_for_recipient: JsonValue,  // ECIES: { ephemeral_pub, nonce, ciphertext }
     pub title_hint:              Option<String>,
+    pub domain_hint:             Option<String>,   // ← NUEVO: dominio en claro para mostrar en la bandeja
     pub message:                 Option<String>,
     pub permission:              Option<String>,   // "view" | "copy"
     pub share_mode:              Option<String>,   // "permanent" | "temporary" | "one_shot"
@@ -62,6 +63,7 @@ pub struct SharedPassword {
     pub sender_id:               Uuid,
     pub recipient_id:            Uuid,
     pub title_hint:              Option<String>,
+    pub domain_hint:             Option<String>,
     pub message:                 Option<String>,
     pub permission:              String,
     pub share_mode:              String,
@@ -76,6 +78,7 @@ pub struct InboxItem {
     pub id:                Uuid,
     pub sender_email_hint: String,
     pub title_hint:        Option<String>,
+    pub domain_hint:       Option<String>,
     pub message:           Option<String>,
     pub permission:        String,
     pub share_mode:        String,
@@ -89,6 +92,7 @@ pub struct SentItem {
     pub id:                   Uuid,
     pub recipient_email_hint: String,
     pub title_hint:           Option<String>,
+    pub domain_hint:          Option<String>,
     pub permission:           String,
     pub share_mode:           String,
     pub status:               String,
@@ -173,10 +177,10 @@ async fn send_share(
         r#"
         INSERT INTO shared_passwords
             (password_id, sender_id, recipient_id, encrypted_for_recipient,
-             title_hint, message, permission, share_mode, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             title_hint, domain_hint, message, permission, share_mode, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, password_id, sender_id, recipient_id,
-                  title_hint, message, permission, share_mode, status,
+                  title_hint, domain_hint, message, permission, share_mode, status,
                   expires_at, created_at, responded_at
         "#,
     )
@@ -185,6 +189,7 @@ async fn send_share(
     .bind(recipient_id)
     .bind(&req.encrypted_for_recipient)
     .bind(req.title_hint.as_deref())
+    .bind(req.domain_hint.as_deref())
     .bind(req.message.as_deref())
     .bind(&permission)
     .bind(&share_mode)
@@ -223,12 +228,13 @@ async fn list_inbox(
     .execute(&mut *tx)
     .await;
 
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>, String, String, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>, Option<String>, String, String, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
         r#"
         SELECT
             sp.id,
             LEFT(u.email, 3) || '***' AS sender_email_hint,
             sp.title_hint,
+            sp.domain_hint,
             sp.message,
             sp.permission,
             sp.share_mode,
@@ -248,8 +254,8 @@ async fn list_inbox(
 
     tx.commit().await?;
 
-    let items = rows.into_iter().map(|(id, sender_email_hint, title_hint, message, permission, share_mode, status, expires_at, created_at)| {
-        InboxItem { id, sender_email_hint, title_hint, message, permission, share_mode, status, expires_at, created_at }
+    let items = rows.into_iter().map(|(id, sender_email_hint, title_hint, domain_hint, message, permission, share_mode, status, expires_at, created_at)| {
+        InboxItem { id, sender_email_hint, title_hint, domain_hint, message, permission, share_mode, status, expires_at, created_at }
     }).collect();
 
     Ok(Json(items))
@@ -261,12 +267,13 @@ async fn list_sent(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<Vec<SentItem>>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>, String, String, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
         r#"
         SELECT
             sp.id,
             LEFT(u.email, 3) || '***' AS recipient_email_hint,
             sp.title_hint,
+            sp.domain_hint,
             sp.permission,
             sp.share_mode,
             sp.status,
@@ -282,8 +289,8 @@ async fn list_sent(
     .bind(auth.user_id)
     .fetch_all(&state.db).await?;
 
-    let items = rows.into_iter().map(|(id, recipient_email_hint, title_hint, permission, share_mode, status, expires_at, created_at)| {
-        SentItem { id, recipient_email_hint, title_hint, permission, share_mode, status, expires_at, created_at }
+    let items = rows.into_iter().map(|(id, recipient_email_hint, title_hint, domain_hint, permission, share_mode, status, expires_at, created_at)| {
+        SentItem { id, recipient_email_hint, title_hint, domain_hint, permission, share_mode, status, expires_at, created_at }
     }).collect();
 
     Ok(Json(items))
