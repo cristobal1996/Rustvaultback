@@ -1,7 +1,9 @@
 // src/routes/auth.rs
 
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::{ConnectInfo, State}, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
@@ -10,6 +12,7 @@ use crate::{
     middleware,
     models::UserPublic,
     state::AppState,
+    totp,
 };
 
 pub fn router() -> Router<AppState> {
@@ -17,13 +20,14 @@ pub fn router() -> Router<AppState> {
         .route("/register",    post(register))
         .route("/login",       post(login))
         .route("/logout",      post(logout))
-        .route("/recover",          post(recover_account))
-        .route("/recover/blob",      post(get_recovery_blob))
-        .route("/recover/save-blob", post(save_recovery_blob))
-        .route("/recover-with-key",  post(recover_with_key))
+        .route("/recover",            post(recover_account))
+        .route("/recover/verify",     post(verify_recover_code))
+        .route("/recover/blob",       post(get_recovery_blob))
+        .route("/recover/save-blob",  post(save_recovery_blob))
+        .route("/recover-with-key",   post(recover_with_key))
         .route("/2fa/setup",   post(setup_2fa))
         .route("/2fa/confirm", post(confirm_2fa))
-        .route("/2fa/disable",  post(disable_2fa))
+        .route("/2fa/disable", post(disable_2fa))
 }
 
 // ── Register ──────────────────────────────────────────────────────
@@ -45,8 +49,12 @@ pub struct RegisterResponse {
 
 async fn register(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>> {
+    // Rate limit: 5 registros por hora por IP (anti spam de cuentas)
+    state.rate_limiter.check(addr.ip(), "register", 5, Duration::from_secs(3600))?;
+
     if req.password.len() < 12 {
         return Err(AppError::Validation("La contraseña debe tener al menos 12 caracteres".into()))
     }
@@ -63,7 +71,6 @@ async fn register(
 
     let password_hash = crypto::hash_password(&req.password).map_err(anyhow::Error::from)?;
 
-    // Generar códigos únicos
     let invite_code    = generate_invite_code();
     let emergency_code = generate_emergency_code();
     let emergency_hash = crypto::hash_token(&emergency_code);
@@ -87,7 +94,6 @@ async fn register(
     let token = middleware::generate_token(user.id, None, &state.cfg.jwt_secret)
         .map_err(|e| AppError::Internal(e))?;
     Ok(Json(RegisterResponse { token, user: user.into(), emergency_code }))
-    
 }
 
 // ── Login ─────────────────────────────────────────────────────────
@@ -97,7 +103,6 @@ pub struct LoginRequest {
     email:              String,
     password:           String,
     totp_code:          Option<String>,
-    totp_muk:           Option<String>,
     device_name:        String,
     platform:           String,
     device_fingerprint: Option<String>,
@@ -113,8 +118,12 @@ pub struct LoginResponse {
 
 async fn login(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>> {
+    // Rate limit: 5 intentos por minuto por IP (anti fuerza-bruta de contraseñas)
+    state.rate_limiter.check(addr.ip(), "login", 5, Duration::from_secs(60))?;
+
     let user = sqlx::query_as::<_, crate::models::User>(
         "SELECT * FROM users WHERE email=$1 AND deleted_at IS NULL"
     )
@@ -122,6 +131,7 @@ async fn login(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::InvalidCredentials)?;
 
+    // 1. Verificar contraseña
     if !crypto::verify_password(&req.password, &user.password_hash) {
         sqlx::query("INSERT INTO audit_log (user_id,action) VALUES ($1,$2)")
             .bind(user.id).bind("login.failed")
@@ -129,47 +139,40 @@ async fn login(
         return Err(AppError::InvalidCredentials)
     }
 
+    // 2. Si el usuario tiene 2FA activado, comprobar el código TOTP
     if user.totp_enabled {
         match &req.totp_code {
             None => {
-                // No viene código — indicar al cliente que lo pida
-                // Generar token temporal de corta duración
-                let device = sqlx::query_as::<_, crate::models::Device>(
-                    "INSERT INTO devices (id,user_id,name,platform,device_fingerprint)
-                     VALUES ($1,$2,$3,$4,$5)
-                     ON CONFLICT (id) DO UPDATE SET last_seen_at=NOW(), name=EXCLUDED.name
-                     RETURNING *"
-                )
-                .bind(Uuid::new_v4())
-                .bind(user.id)
-                .bind(&req.device_name)
-                .bind(&req.platform)
-                .bind(&req.device_fingerprint)
-                .fetch_one(&state.db).await?;
-
-                let token = middleware::generate_token(user.id, Some(device.id), &state.cfg.jwt_secret)
-                    .map_err(|e| AppError::Internal(e))?;
-
+                // No viene código → pedirlo al cliente, NO crear sesión aún
                 return Ok(Json(LoginResponse {
-                    token,
+                    token:        String::new(),       // sin token
                     srp_salt:     user.srp_salt.clone(),
                     requires_2fa: true,
                     user:         user.into(),
                 }))
             }
             Some(code) => {
-                // Verificar el código TOTP
-                if let Some(encrypted_secret) = &user.totp_secret {
-                    let muk_hex = &req.totp_muk.clone().unwrap_or_default();
-                    // Por ahora aceptamos cualquier código de 6 dígitos válido
-                    // En producción aquí verificarías con la librería totp-rs
-                    let _ = code;
-                    let _ = encrypted_secret;
+                // Validar el código TOTP contra el secret guardado
+                let secret_hex = user.totp_secret.as_ref()
+                    .ok_or_else(|| AppError::Internal(anyhow::anyhow!(
+                        "Usuario tiene totp_enabled=true pero totp_secret es NULL"
+                    )))?;
+
+                let valid = totp::verify_code(secret_hex, code.trim())
+                    .map_err(|e| AppError::Internal(e))?;
+
+                if !valid {
+                    sqlx::query("INSERT INTO audit_log (user_id,action) VALUES ($1,$2)")
+                        .bind(user.id).bind("login.totp_failed")
+                        .execute(&state.db).await?;
+                    return Err(AppError::InvalidCredentials);
                 }
+                // ✓ TOTP válido, continuamos al login normal
             }
         }
     }
 
+    // 3. Login válido — crear dispositivo y sesión
     let device = sqlx::query_as::<_, crate::models::Device>(
         "INSERT INTO devices (id,user_id,name,platform,device_fingerprint)
          VALUES ($1,$2,$3,$4,$5)
@@ -204,7 +207,7 @@ async fn login(
     Ok(Json(LoginResponse {
         token,
         srp_salt:     user.srp_salt.clone(),
-        requires_2fa: user.totp_enabled,
+        requires_2fa: false,  // ← false porque ya pasamos el 2FA (si aplicaba)
         user:         user.into(),
     }))
 }
@@ -242,8 +245,12 @@ pub struct RecoverRequest {
 
 async fn recover_account(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RecoverRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    // Rate limit: 3 intentos por hora por IP (anti fuerza-bruta del emergency_code)
+    state.rate_limiter.check(addr.ip(), "recover", 3, Duration::from_secs(3600))?;
+
     let code_hash = crypto::hash_token(&req.emergency_code.trim().to_uppercase());
 
     let user = sqlx::query_as::<_, crate::models::User>(
@@ -254,10 +261,8 @@ async fn recover_account(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::Unauthorized)?;
 
-    // Todo en una transacción: si algo falla, se revierte
     let mut tx = state.db.begin().await?;
 
-    // 1. Revocar sesiones activas (por seguridad, aunque luego se borren con CASCADE)
     sqlx::query(
         "UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL"
     )
@@ -265,23 +270,16 @@ async fn recover_account(
     .execute(&mut *tx)
     .await?;
 
-    // 2. Borrar entradas del audit_log de este usuario
-    //    (audit_log.user_id no tiene ON DELETE CASCADE)
     sqlx::query("DELETE FROM audit_log WHERE user_id=$1")
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
 
-    // 3. DELETE físico del usuario.
-    //    CASCADE borra automáticamente: devices, sessions, passwords,
-    //    password_versions, totp_credentials, generator_profiles,
-    //    shared_passwords (como sender y como recipient).
     sqlx::query("DELETE FROM users WHERE id=$1")
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
 
-    // 4. Registrar en audit_log SIN user_id (el usuario ya no existe)
     sqlx::query(
         "INSERT INTO audit_log (user_id, action, metadata)
          VALUES (NULL, 'account.emergency_deleted', $1)"
@@ -298,65 +296,76 @@ async fn recover_account(
     })))
 }
 
+// ── Verificar emergency_code sin borrar (validación previa) ─────
+
+/// Comprueba si un email + emergency_code son válidos, sin borrar nada.
+/// Sirve para que el frontend pueda validar antes de mostrar la pantalla
+/// de confirmación final, dando feedback claro al usuario.
+async fn verify_recover_code(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<RecoverRequest>,
+) -> Result<Json<serde_json::Value>> {
+    // Rate limit: 3 intentos por hora por IP (mismo límite que recover_account)
+    state.rate_limiter.check(addr.ip(), "recover_verify", 3, Duration::from_secs(3600))?;
+
+    let code_hash = crypto::hash_token(&req.emergency_code.trim().to_uppercase());
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users
+             WHERE email = $1
+               AND emergency_code_hash = $2
+               AND deleted_at IS NULL
+         )"
+    )
+    .bind(req.email.trim().to_lowercase())
+    .bind(&code_hash)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !exists {
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok(Json(serde_json::json!({ "valid": true })))
+}
+
 // ── 2FA ───────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct Setup2FAResponse {
-    qr_code_url:  String,
-    manual_key:   String,
-    backup_codes: Vec<String>,
+    pub secret_hex:   String,        // ← lo necesita el cliente para mandarlo en confirm
+    pub qr_code_url:  String,
+    pub manual_key:   String,
+    pub backup_codes: Vec<String>,
 }
 
 async fn setup_2fa(
-    State(_state): State<AppState>,
-    _auth: crate::middleware::AuthUser,
+    State(state): State<AppState>,
+    auth: crate::middleware::AuthUser,
 ) -> Result<Json<Setup2FAResponse>> {
-    // Generar 20 bytes aleatorios y convertir a Base32
-    // Los autenticadores (Google Authenticator, Authy) requieren Base32
-    let secret_hex   = crypto::random_hex(20);
-    let secret_bytes = hex::decode(&secret_hex).unwrap_or_default();
-    let secret_b32   = base32_encode(&secret_bytes);
+    // Obtener el email del usuario para incluirlo en la URL otpauth
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id=$1")
+        .bind(auth.user_id)
+        .fetch_one(&state.db).await?;
 
-    let backup_codes: Vec<String> = (0..8)
-        .map(|_| crypto::random_hex(5).to_uppercase())
-        .collect();
+    let data = totp::generate_setup(&email)
+        .map_err(|e| AppError::Internal(e))?;
 
     Ok(Json(Setup2FAResponse {
-        qr_code_url: format!(
-            "otpauth://totp/RustVault?secret={}&issuer=RustVault&algorithm=SHA1&digits=6&period=30",
-            secret_b32
-        ),
-        manual_key:  secret_b32,
-        backup_codes,
+        secret_hex:   data.secret_hex,
+        qr_code_url:  data.otpauth_url,
+        manual_key:   data.manual_key,
+        backup_codes: data.backup_codes,
     }))
-}
-
-/// Convierte bytes a Base32 estándar (RFC 4648) sin padding
-fn base32_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut result = String::new();
-    let mut buffer = 0u32;
-    let mut bits   = 0u32;
-
-    for &byte in bytes {
-        buffer = (buffer << 8) | byte as u32;
-        bits  += 8;
-        while bits >= 5 {
-            bits -= 5;
-            result.push(ALPHABET[((buffer >> bits) & 0x1F) as usize] as char);
-        }
-    }
-    if bits > 0 {
-        result.push(ALPHABET[((buffer << (5 - bits)) & 0x1F) as usize] as char);
-    }
-    result
 }
 
 #[derive(Deserialize)]
 pub struct Confirm2FARequest {
-    totp_code:              String,
-    encrypted_secret:       serde_json::Value,
-    encrypted_backup_codes: serde_json::Value,
+    pub secret_hex:    String,         // ← el secret que generamos en setup
+    pub totp_code:     String,         // ← el código que el usuario ve en su app
+    pub backup_codes:  Vec<String>,    // ← los códigos para hashear y guardar
 }
 
 async fn confirm_2fa(
@@ -364,13 +373,27 @@ async fn confirm_2fa(
     auth: crate::middleware::AuthUser,
     Json(req): Json<Confirm2FARequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let _ = req.totp_code;
+    // 1. Validar que el código TOTP es correcto (demostrando que el usuario
+    //    escaneó bien el QR antes de activar 2FA)
+    let valid = totp::verify_code(&req.secret_hex, req.totp_code.trim())
+        .map_err(|e| AppError::Internal(e))?;
 
+    if !valid {
+        return Err(AppError::Validation(
+            "El código TOTP no es válido. Asegúrate de haber escaneado correctamente el QR.".into()
+        ));
+    }
+
+    // 2. Hashear los backup codes con Argon2id
+    let hashed_codes = totp::prepare_backup_codes(&req.backup_codes)
+        .map_err(|e| AppError::Internal(e))?;
+
+    // 3. Activar 2FA y guardar el secret + backup codes
     sqlx::query(
         "UPDATE users SET totp_secret=$1, totp_backup_codes=$2, totp_enabled=true WHERE id=$3"
     )
-    .bind(&req.encrypted_secret)
-    .bind(&req.encrypted_backup_codes)
+    .bind(&req.secret_hex)
+    .bind(&hashed_codes)
     .bind(auth.user_id)
     .execute(&state.db).await?;
 
@@ -380,24 +403,6 @@ async fn confirm_2fa(
 
     Ok(Json(serde_json::json!({ "2fa_enabled": true })))
 }
-
-// ── Helpers ───────────────────────────────────────────────────────
-
-fn generate_invite_code() -> String {
-    format!("RV-{}-{}",
-        crate::crypto::random_hex(2).to_uppercase(),
-        crate::crypto::random_hex(2).to_uppercase()
-    )
-}
-
-fn generate_emergency_code() -> String {
-    format!("ERV-{}-{}-{}",
-        crate::crypto::random_hex(2).to_uppercase(),
-        crate::crypto::random_hex(2).to_uppercase(),
-        crate::crypto::random_hex(2).to_uppercase()
-    )
-}
-
 
 // ── Desactivar 2FA ────────────────────────────────────────────────
 
@@ -418,13 +423,28 @@ async fn disable_2fa(
     Ok(Json(serde_json::json!({ "disabled": true })))
 }
 
+// ── Helpers ───────────────────────────────────────────────────────
+
+fn generate_invite_code() -> String {
+    format!("RV-{}-{}",
+        crate::crypto::random_hex(2).to_uppercase(),
+        crate::crypto::random_hex(2).to_uppercase()
+    )
+}
+
+fn generate_emergency_code() -> String {
+    format!("ERV-{}-{}-{}",
+        crate::crypto::random_hex(2).to_uppercase(),
+        crate::crypto::random_hex(2).to_uppercase(),
+        crate::crypto::random_hex(2).to_uppercase()
+    )
+}
 
 // ── Guardar recovery blob al registrarse ─────────────────────────
-// El cliente cifra la MUK con la Recovery Key y guarda el blob
 
 #[derive(serde::Deserialize)]
 pub struct SaveRecoveryBlobRequest {
-    pub recovery_blob: serde_json::Value,  // { nonce, ciphertext } — MUK cifrada con Recovery Key
+    pub recovery_blob: serde_json::Value,
 }
 
 async fn save_recovery_blob(
@@ -441,7 +461,6 @@ async fn save_recovery_blob(
 }
 
 // ── Obtener recovery blob para recuperar contraseña ───────────────
-// Sin autenticación — solo necesita email
 
 #[derive(serde::Deserialize)]
 pub struct GetRecoveryBlobRequest {
@@ -472,15 +491,13 @@ async fn get_recovery_blob(
     }))
 }
 
-
 // ── Recuperar contraseña con Recovery Key ────────────────────────
-// Verifica que el recovery_blob descifra correctamente con la key
-// y devuelve un token de sesión para poder re-cifrar las contraseñas
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 pub struct RecoverWithKeyRequest {
     pub email:            String,
-    pub recovery_key:     String,   // 64 chars hex
+    pub recovery_key:     String,
     pub new_password:     String,
     pub new_srp_salt:     String,
     pub new_srp_verifier: String,
@@ -488,9 +505,12 @@ pub struct RecoverWithKeyRequest {
 
 async fn recover_with_key(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RecoverWithKeyRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    // Buscar usuario
+    // Rate limit: 3 intentos por hora por IP (anti fuerza-bruta de la Recovery Key)
+    state.rate_limiter.check(addr.ip(), "recover_with_key", 3, Duration::from_secs(3600))?;
+
     let user = sqlx::query_as::<_, crate::models::User>(
         "SELECT * FROM users WHERE email=$1 AND deleted_at IS NULL AND recovery_blob IS NOT NULL"
     )
@@ -498,7 +518,6 @@ async fn recover_with_key(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
 
-    // Actualizar contraseña
     let new_password_hash = crypto::hash_password(&req.new_password)
         .map_err(anyhow::Error::from)?;
 
@@ -513,7 +532,6 @@ async fn recover_with_key(
     .bind(user.id)
     .execute(&mut *tx).await?;
 
-    // Crear sesión
     let device = sqlx::query_as::<_, crate::models::Device>(
         "INSERT INTO devices (id,user_id,name,platform)
          VALUES ($1,$2,$3,$4) RETURNING *"

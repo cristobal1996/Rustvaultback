@@ -1,5 +1,5 @@
 // src/routes/generator.rs
-use axum::{extract::State, routing::{get, post, put, delete}, Json, Router};
+use axum::{extract::State, routing::{get, post, put}, Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use rand::RngCore;

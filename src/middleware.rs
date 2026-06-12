@@ -26,6 +26,7 @@ pub struct Claims {
 /// Extractor de Axum: cualquier handler que declare `AuthUser`
 /// requiere automáticamente un JWT válido.
 /// El compilador garantiza que no puedes olvidar proteger una ruta.
+#[allow(dead_code)]
 pub struct AuthUser {
     pub user_id:   Uuid,
     pub device_id: Option<Uuid>,

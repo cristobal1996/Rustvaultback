@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/models.rs — modelos del nuevo esquema sin vaults
 
 use chrono::{DateTime, Utc};
@@ -14,7 +16,7 @@ pub struct User {
     pub password_hash:             String,
     pub srp_salt:                  String,
     pub srp_verifier:              String,
-    pub totp_secret:               Option<JsonValue>,
+    pub totp_secret:               Option<String>,        // ← CAMBIADO: era Option<JsonValue>
     pub totp_enabled:              bool,
     pub totp_backup_codes:         Option<JsonValue>,
     pub pub_key:                   Option<String>,
@@ -52,7 +54,7 @@ impl From<User> for UserPublic {
             invite_code:         u.invite_code,
             pub_key:             u.pub_key,
             encrypted_priv_key:  u.encrypted_priv_key,
-            recovery_blob:       u.recovery_blob.clone().map(|_| serde_json::json!(true)), // solo indicar si existe
+            recovery_blob:       u.recovery_blob.clone().map(|_| serde_json::json!(true)),
             created_at:          u.created_at,
         }
     }
@@ -112,7 +114,10 @@ pub struct PasswordVersion {
     pub changed_at:  DateTime<Utc>,
 }
 
-// ── TOTP ──────────────────────────────────────────────────────────
+// ── TOTP (CREDENCIALES EXTERNAS - se queda igual) ────────────────
+// Esto NO cambia: son los TOTP de servicios externos (GitHub, Google, etc.)
+// que el usuario guarda en RustVault. Esos SÍ siguen siendo zero-knowledge
+// porque el usuario los descifra en el cliente para mostrar los códigos.
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TotpCredential {
@@ -165,8 +170,9 @@ pub struct SharedPassword {
     pub title_hint:              Option<String>,
     pub message:                 Option<String>,
     pub permission:              String,
+    pub share_mode:              String,                  // ← NUEVO: 'permanent' | 'temporary' | 'one_shot'
     pub status:                  String,
-    pub expires_at:              DateTime<Utc>,
+    pub expires_at:              Option<DateTime<Utc>>,   // ← ahora Option (NULL para permanent)
     pub created_at:              DateTime<Utc>,
     pub responded_at:            Option<DateTime<Utc>>,
 }

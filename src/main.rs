@@ -7,6 +7,7 @@ mod errors;
 mod middleware;
 mod models;
 mod pagination;
+mod rate_limit;
 mod routes;
 mod state;
 mod totp;
@@ -14,6 +15,7 @@ mod validation;
 
 use axum::Router;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::signal;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -44,6 +46,15 @@ async fn main() -> anyhow::Result<()> {
 
     let state = state::AppState::new(pool, cfg.clone());
 
+    // Limpieza periódica del rate limiter: cada 5 minutos, descarta intentos
+    // más viejos de 1 hora (suficiente para la ventana más larga de 3600s).
+    rate_limit::start_cleanup_task(
+        state.rate_limiter.clone(),
+        Duration::from_secs(300),
+        Duration::from_secs(3600),
+    );
+    tracing::info!("Rate limiter activado");
+
     let app = Router::new()
         .nest("/api/auth",      routes::auth::router())
         .nest("/api/account",   routes::account::router())
@@ -62,9 +73,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Servidor en http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    // IMPORTANTE: into_make_service_with_connect_info::<SocketAddr>() es
+    // necesario para que el extractor `ConnectInfo<SocketAddr>` funcione
+    // en los handlers (lo usa el rate limiter para conocer la IP del cliente).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

@@ -99,16 +99,37 @@ async fn clean_sessions(db: &PgPool, retention_days: i32) -> sqlx::Result<u64> {
 }
 
 async fn clean_expired_shares(db: &PgPool) -> sqlx::Result<u64> {
-    // Marcar como expiradas las pendientes caducadas
+    // 1. Borrado FÍSICO de temporales/one_shot expiradas (NO se conservan)
+    let deleted_physical = sqlx::query(
+        "DELETE FROM shared_passwords
+         WHERE share_mode IN ('temporary', 'one_shot')
+           AND expires_at IS NOT NULL
+           AND expires_at < NOW()
+           AND status = 'pending'"
+    ).execute(db).await?.rows_affected();
+
+    // 2. Para las permanentes con expires_at legacy (datos antiguos),
+    //    marcar como expiradas (no borrar — son comparticiones que el
+    //    usuario podría querer consultar en su historial).
     sqlx::query(
-        "UPDATE shared_passwords SET status='expired' WHERE status='pending' AND expires_at < NOW()"
+        "UPDATE shared_passwords
+         SET status='expired'
+         WHERE share_mode = 'permanent'
+           AND status='pending'
+           AND expires_at IS NOT NULL
+           AND expires_at < NOW()"
     ).execute(db).await?;
 
-    // Borrar las procesadas con más de 30 días
-    Ok(sqlx::query(
-        "DELETE FROM shared_passwords WHERE status IN ('expired','rejected','accepted')
-         AND created_at < NOW() - INTERVAL '30 days'"
-    ).execute(db).await?.rows_affected())
+    // 3. Borrar las permanentes procesadas (accepted/rejected/expired) con
+    //    más de 30 días. Mantiene la BD limpia sin perder info reciente.
+    let deleted_old = sqlx::query(
+        "DELETE FROM shared_passwords
+         WHERE share_mode = 'permanent'
+           AND status IN ('expired','rejected','accepted')
+           AND created_at < NOW() - INTERVAL '30 days'"
+    ).execute(db).await?.rows_affected();
+
+    Ok(deleted_physical + deleted_old)
 }
 
 async fn clean_deleted_passwords(db: &PgPool, retention_days: i32) -> sqlx::Result<u64> {

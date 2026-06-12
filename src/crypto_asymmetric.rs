@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/crypto_asymmetric.rs
 //
 // Criptografía asimétrica para vaults compartidos.

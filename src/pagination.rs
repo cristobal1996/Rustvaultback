@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/pagination.rs
 //
 // Módulo de paginación reutilizable para todos los endpoints que

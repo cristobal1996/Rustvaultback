@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{delete, get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ pub struct UpdateRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct ListQuery {
     pub domain:     Option<String>,
     pub entry_type: Option<String>,

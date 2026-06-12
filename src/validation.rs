@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/validation.rs
 //
 // Validación centralizada de todos los inputs que llegan al servidor.

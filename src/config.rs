@@ -1,6 +1,7 @@
 use std::env;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Config {
     pub database_url: String,
     pub jwt_secret:   String,
@@ -8,6 +9,7 @@ pub struct Config {
     pub env:          String,
 }
 
+#[allow(dead_code)]
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
